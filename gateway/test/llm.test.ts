@@ -83,6 +83,39 @@ describe('createLLM resilience', () => {
     await expect(llm.chat(hi, [])).rejects.toThrow(/timed out/i)
   })
 
+it("fails when the response body never arrives, even though the signal does not settle it", async () => {
+  const bodyNeverArrives = ((_url: string, _init?: RequestInit) => Promise.resolve({
+    ok: true,
+    status: 200,
+    headers: new Headers(),
+    json: () => new Promise(() => {}),
+    text: async () => "",
+  } as unknown as Response)) as unknown as typeof fetch
+  const llm = createLLM(loadConfig({ OPENGROKBOT_LLM_TIMEOUT_MS: "20", OPENGROKBOT_LLM_RETRIES: "0" }), bodyNeverArrives, async () => {})
+  await expect(llm.chat(hi, [])).rejects.toThrow(/timed out/i)
+})
+
+it("stops at once when the operator stops the turn mid-body, even if the body never arrives", async () => {
+  const bodyNeverArrives = ((_url: string, _init?: RequestInit) => Promise.resolve({
+    ok: true,
+    status: 200,
+    headers: new Headers(),
+    json: () => new Promise(() => {}),
+    text: async () => "",
+  } as unknown as Response)) as unknown as typeof fetch
+  const stop = new AbortController()
+  const llm = createLLM(loadConfig({ OPENGROKBOT_LLM_TIMEOUT_MS: "120000", OPENGROKBOT_LLM_RETRIES: "2" }), bodyNeverArrives, async () => {})
+  const pending = llm.chat(hi, [], { signal: stop.signal })
+  stop.abort()
+  await expect(pending).rejects.toThrow()
+})
+
+it("treats a response with no content and no tool calls as a failed turn", async () => {
+  const empty = ((_url: string, _init?: RequestInit) => Promise.resolve(new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: null } }] }), { status: 200, headers: { "Content-Type": "application/json" } }))) as unknown as typeof fetch
+  const llm = createLLM(loadConfig({}), empty, async () => {})
+  await expect(llm.chat(hi, [])).rejects.toThrow(/empty response/)
+})
+
   it('stops at once when the operator stops the turn, without retrying', async () => {
     let calls = 0
     const hang = ((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {

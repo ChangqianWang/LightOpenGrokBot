@@ -41,6 +41,58 @@ function retryAfterMs(res: Response): number | null {
   return Number.isFinite(at) ? Math.min(Math.max(at - Date.now(), 0), 30_000) : null
 }
 
+// 上游有时只回 200 响应头就不再给体（chunked + br），体永远不到；这种
+// 已经拿到头、体却卡住的流，AbortSignal 再怎么 abort 也救不了 res.json() /
+// res.text()，回合会一直挂在思考中，/stop 也解不开。每个可能卡住的
+// await 再包一层普通的 setTimeout 竞速：它一定会到时；操作员按停止，
+// abort 信号也会立刻把它打断。
+function raceAttempt<T>(p: Promise<T>, ms: number, signal: AbortSignal | undefined): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
+  const fallback = new Promise<T>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`LLM API timed out after ${ms / 1000}s`)), ms)
+    if (signal) {
+      if (signal.aborted) {
+        reject(abortReason(signal))
+        return
+      }
+      onAbort = () => reject(abortReason(signal))
+      signal.addEventListener("abort", onAbort, { once: true })
+    }
+  })
+  return Promise.race([p, fallback]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer)
+    if (signal && onAbort) signal.removeEventListener("abort", onAbort)
+  })
+}
+
+function abortReason(signal: AbortSignal): Error {
+  const reason = signal.reason
+  return reason instanceof Error ? reason : new Error("aborted")
+}
+
+// 等待（通常是重试前的退避），操作员按停止时立刻醒，不必等满。
+function abortableWait(p: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
+  if (!signal) return p
+  if (signal.aborted) return Promise.reject(abortReason(signal))
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => reject(abortReason(signal))
+    signal.addEventListener("abort", onAbort, { once: true })
+    p.then(
+      () => {
+        signal.removeEventListener("abort", onAbort)
+        resolve()
+      },
+      (err) => {
+        signal.removeEventListener("abort", onAbort)
+        reject(err)
+      },
+    )
+  })
+}
+
+const isLlmTimeout = (err: unknown): boolean => err instanceof Error && err.message.startsWith("LLM API timed out after ")
+
 function toWire(m: ChatMsg): Record<string, unknown> {
   const { images, ...rest } = m
   if (!images?.length) return rest
@@ -76,38 +128,51 @@ export function createLLM(config: Config, fetchImpl: typeof fetch = fetch, sleep
         const timeout = AbortSignal.timeout(config.llmTimeoutMs)
         const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout
         try {
-          const res = await fetchImpl(url, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
-            },
-            body,
-            signal,
-          })
+    const res = await raceAttempt(
+      fetchImpl(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {} ),
+        },
+        body,
+        signal,
+      }),
+      config.llmTimeoutMs,
+      opts.signal,
+    )
           if (!res.ok) {
-            const detail = (await res.text().catch(() => '')).slice(0, 300)
+      const detail = (await raceAttempt(res.text(), config.llmTimeoutMs, opts.signal).catch((e) => { if (opts.signal?.aborted) throw e; return "" })).slice(0, 300)
             if (RETRYABLE.has(res.status) && canRetry) {
-              await sleep(retryAfterMs(res) ?? backoffMs(attempt))
+        await abortableWait(sleep(retryAfterMs(res) ?? backoffMs(attempt)), opts.signal)
               continue
             }
             throw new ProviderError(`LLM API ${res.status}: ${detail}`)
           }
-          data = (await res.json()) as WireResponse
+    data = (await raceAttempt(res.json(), config.llmTimeoutMs, opts.signal)) as WireResponse
           break
         } catch (err) {
           if (err instanceof ProviderError) throw err
           if (opts.signal?.aborted) throw err // 操作者按了停止：立刻收手，不重试
-          if (canRetry) {
-            await sleep(backoffMs(attempt))
-            continue
-          }
+    if (isLlmTimeout(err)) {
+      // 超时也按配置重试；重试耗尽后把超时原样报出去，不包成 unreachable
+      if (canRetry) {
+        await abortableWait(sleep(backoffMs(attempt)), opts.signal)
+        continue
+      }
+      throw err
+    }
+    if (canRetry) {
+      await abortableWait(sleep(backoffMs(attempt)), opts.signal)
+      continue
+    }
           if (timeout.aborted) throw new Error(`LLM API timed out after ${config.llmTimeoutMs / 1000}s`)
           throw new Error(`LLM API unreachable: ${err instanceof Error ? err.message : String(err)}`)
         }
       }
       const msg = data.choices?.[0]?.message
       if (!msg) throw new Error('LLM API: empty choices')
+  if ((msg.content == null || msg.content.trim() === "") && (msg.tool_calls ?? []).length === 0) throw new ProviderError("LLM API: empty response")
       return {
         content: msg.content ?? null,
         toolCalls: (msg.tool_calls ?? []).map((t) => ({

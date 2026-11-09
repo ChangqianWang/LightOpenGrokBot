@@ -192,6 +192,7 @@ export async function runTurn(
     }
   } catch (err) {
     if (signal?.aborted) return stopped(say)
+    console.error(`[agent ${bot.id}] turn error:`, err)
     say(`⚠️ ${bot.name} hit an error: ${err instanceof Error ? err.message : String(err)}`)
     return 'error'
   } finally {

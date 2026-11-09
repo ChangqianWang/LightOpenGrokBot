@@ -10,6 +10,7 @@ import { chooseBackend, createDockerBackend, createLocalBackend, dockerReachable
 import { loadConfig } from './config.js'
 import { botShellEnabled, openDb } from './db.js'
 import { createLLM } from './llm.js'
+import { createHttp2Fetch } from './http2fetch.js'
 import { migrateLegacyMemories } from './memory.js'
 import { createPool, reapIdleComputers } from './pool.js'
 import { listRoutines } from './routines.js'
@@ -35,7 +36,7 @@ const bots = [
 seedGroup(db, { id: config.groupId, title: config.groupTitle, memberIds: bots })
 const movedMemories = await migrateLegacyMemories(config.dataDir, bots)
 if (movedMemories.length) console.log(`[gateway] moved MEMORY.md out of the workspaces of: ${movedMemories.join(', ')}`)
-const llm = createLLM(config)
+const llm = createLLM(config, createHttp2Fetch())
 // 同事的电脑是什么做的：有 Docker 用容器，没有就用本机模式（宿主上的浏览器 + 一个文件夹）
 const docker = new Docker()
 const sandbox = detectSandbox()
